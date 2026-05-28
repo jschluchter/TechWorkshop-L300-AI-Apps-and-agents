@@ -35,8 +35,15 @@ async def handle_single_agent(websocket, user_message: str, persistent_cart: lis
         }))
     except Exception as e:
         logger.error("Error during single-agent response generation", exc_info=True)
+        error_text = str(e)
+        answer_text = "Error during single-agent response generation"
+        if "Resource not found" in error_text:
+            answer_text = (
+                "Single-agent call failed with Azure 404. "
+                "Verify gpt_endpoint is the resource base URL and gpt_deployment exists in that resource."
+            )
         await websocket.send_text(fast_json_dumps({
-            "answer": "Error during single-agent response generation",
-            "error": str(e),
+            "answer": answer_text,
+            "error": error_text,
             "cart": persistent_cart,
         }))

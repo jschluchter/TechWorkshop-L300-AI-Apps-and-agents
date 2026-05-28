@@ -11,13 +11,13 @@ import orjson  # Faster JSON library
 from dotenv import load_dotenv
 from opentelemetry import trace
 import logging
-# from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
+from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
 
 # Azure & OpenAI Imports
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
 from openai import AzureOpenAI
-# from azure.monitor.opentelemetry import configure_azure_monitor
+from azure.monitor.opentelemetry import configure_azure_monitor
 # from azure.ai.agents.telemetry import trace_function
 
 # FastAPI Imports
@@ -43,11 +43,11 @@ from utils.message_utils import (
 from app.tools.understandImage import get_image_description
 from services.agent_service import get_or_create_agent_processor
 # from handlers.single_agent_handler import handle_single_agent
-# from handlers.multi_agent_handler import (
-#     classify_intent, enrich_context, execute_agent,
-#     handle_image_creation, process_response,
-# )
-# from services.handoff_service import HandoffService
+from handlers.multi_agent_handler import (
+    classify_intent, enrich_context, execute_agent,
+    handle_image_creation, process_response,
+)
+from services.handoff_service import HandoffService
 
 
 load_dotenv()
@@ -55,18 +55,29 @@ env_vars = load_env_vars()
 validated_env_vars = validate_env_vars(env_vars)
 
 # Configure structured logging
+log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
 logging.basicConfig(
-    level=logging.WARNING,
+    level=log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logger.info("Logging configured", extra={"log_level": log_level_name})
 
 # Global thread pool executor for CPU-bound operations
 thread_pool = ThreadPoolExecutor(max_workers=4)
 
-# application_insights_connection_string = os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
-# configure_azure_monitor(connection_string=application_insights_connection_string)
-# OpenAIInstrumentor().instrument()
+application_insights_connection_string = os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
+configure_azure_monitor(connection_string=application_insights_connection_string)
+OpenAIInstrumentor().instrument()
+logger.info(
+    "Telemetry initialized for chat app",
+    extra={
+        "trace_component": "chat_app",
+        "has_appinsights_connection_string": bool(application_insights_connection_string),
+        "foundry_endpoint": bool(os.environ.get("FOUNDRY_ENDPOINT")),
+    },
+)
 
 scenario = os.path.basename(__file__)
 tracer = trace.get_tracer(__name__)
@@ -125,18 +136,18 @@ project_client = AIProjectClient(
     credential=DefaultAzureCredential(),
 )
 
-# # LLM client for the handoff service.
-# # Retrieves an AzureOpenAI client from the project client.
-# # Handoff service determines which agent to route to based on intent classification.
-# # The default for this is Cora, the general shopping assistant.
-# llm_client = project_client.get_openai_client()
+# LLM client for the handoff service.
+# Retrieves an AzureOpenAI client from the project client.
+# Handoff service determines which agent to route to based on intent classification.
+# The default for this is Cora, the general shopping assistant.
+llm_client = project_client.get_openai_client()
 
-# handoff_service = HandoffService(
-#     azure_openai_client=llm_client,
-#     deployment_name=validated_env_vars['gpt_deployment'],
-#     default_domain="cora",
-#     lazy_classification=True
-# )
+handoff_service = HandoffService(
+    azure_openai_client=llm_client,
+    deployment_name=validated_env_vars['gpt_deployment'],
+    default_domain="cora",
+    lazy_classification=True
+)
 
 @app.get("/")
 async def get():
@@ -178,11 +189,38 @@ async def websocket_endpoint(websocket: WebSocket):
     bad_prompts = set()                             # Set to track bad prompts for redaction
     raw_io_history = deque(maxlen=100)              # Use deque with maxlen for raw_io_history to prevent unbounded growth
 
-    async def run_customer_loyalty_task(customer_id):
+    loyalty_keywords = (
+        "discount", "loyalty", "promotion", "promotions", "membership", "member",
+        "rewards", "benefit", "benefits", "coupon", "save", "offer", "offers"
+    )
+    cart_keywords = (
+        "cart", "add to cart", "remove from cart", "remove", "checkout", "clear cart",
+        "show cart", "view cart", "what's in my cart", "what is in my cart", "my cart"
+    )
+    cart_view_keywords = (
+        "show cart", "view cart", "what's in my cart", "what is in my cart", "my cart", "current cart"
+    )
+    cart_action_verbs = (
+        "add", "remove", "delete", "clear", "put", "drop", "update", "change", "take out"
+    )
+
+    async def run_customer_loyalty_task(customer_id, user_query=None):
         start_time = time.time()
+        logger.info(
+            "Starting traced customer loyalty task",
+            extra={
+                "trace_component": "customer_loyalty_task",
+                "session_id": session_id,
+                "customer_id": customer_id,
+            },
+        )
         with tracer.start_as_current_span("Run Customer Loyalty Thread"):
             nonlocal session_discount_percentage, session_loyalty_response
-            message = f"Calculate discount for the customer with id {customer_id}"
+            # If user_query provided, use it; otherwise create a default message
+            if user_query:
+                message = f"{user_query} (Customer ID: {customer_id} for reference)"
+            else:
+                message = f"Calculate discount for the customer with id {customer_id}"
             customer_loyalty_id = validated_env_vars.get('customer_loyalty')
             if not customer_loyalty_id:
                 session_loyalty_response = {"answer": "Customer loyalty agent not configured.", "agent": "customer_loyalty"}
@@ -207,6 +245,16 @@ async def websocket_endpoint(websocket: WebSocket):
             session_loyalty_response = parsed_response  # Store the full response for later
             # Do NOT send the response here!
             log_timing("Customer Loyalty Task", start_time, f"Discount: {session_discount_percentage}")
+            logger.info(
+                "Completed traced customer loyalty task",
+                extra={
+                    "trace_component": "customer_loyalty_task",
+                    "session_id": session_id,
+                    "customer_id": customer_id,
+                    "agent_id": customer_loyalty_id,
+                    "discount_percentage": session_discount_percentage,
+                },
+            )
 
     try:
         while True:
@@ -243,8 +291,52 @@ async def websocket_endpoint(websocket: WebSocket):
                 conversation_history = ""
             
             chat_history = parse_conversation_history(conversation_history, chat_history, user_message)
+
+            is_loyalty_intent = any(k in user_message.lower() for k in loyalty_keywords)
+            is_cart_intent = any(k in user_message.lower() for k in cart_keywords)
+            has_cart_action_verb = any(v in user_message.lower() for v in cart_action_verbs)
+            is_cart_view_intent = (
+                any(k in user_message.lower() for k in cart_view_keywords) and not has_cart_action_verb
+            )
+
+            # Fast-path loyalty questions so they do not get answered by catalog-only agents.
+            if is_loyalty_intent:
+                customer_id = "CUST001"
+                if not session_loyalty_response:
+                    logger.info(
+                        "Loyalty intent detected with no cached loyalty response; running loyalty task now",
+                        extra={"trace_component": "customer_loyalty_task", "session_id": session_id},
+                    )
+                    await run_customer_loyalty_task(customer_id, user_message)
+                    customer_loyalty_executed = True
+
+                if session_loyalty_response:
+                    loyalty_payload = {**session_loyalty_response, "cart": persistent_cart}
+                    raw_io_history.append({"output": fast_json_dumps(loyalty_payload), "cart": persistent_cart})
+                    await websocket.send_text(fast_json_dumps(loyalty_payload))
+                    loyalty_response_sent = True
+                    continue
+
+            # Fast-path cart view requests from session state.
+            if is_cart_view_intent:
+                if persistent_cart:
+                    cart_summary = {
+                        "answer": f"You have {len(persistent_cart)} item(s) in your cart.",
+                        "agent": "cart_manager",
+                        "cart": persistent_cart,
+                    }
+                else:
+                    cart_summary = {
+                        "answer": "Your cart is currently empty.",
+                        "agent": "cart_manager",
+                        "cart": persistent_cart,
+                    }
+
+                raw_io_history.append({"output": fast_json_dumps(cart_summary), "cart": persistent_cart})
+                await websocket.send_text(fast_json_dumps(cart_summary))
+                continue
             
-            await websocket.send_text(fast_json_dumps({"answer": "This application is not yet ready to serve results. Please check back later.", "agent": None, "cart": persistent_cart}))
+            # await websocket.send_text(fast_json_dumps({"answer": "This application is not yet ready to serve results. Please check back later.", "agent": None, "cart": persistent_cart}))
 
             # =================================================================
             # EXERCISE 02: Single-agent example
@@ -261,92 +353,107 @@ async def websocket_endpoint(websocket: WebSocket):
             # each step.
             # =================================================================
 
-            # # --- Step 1: Run customer loyalty in background (once per session) ---
-            # customer_id = "CUST001"
-            # if not customer_loyalty_executed:
-            #     asyncio.create_task(run_customer_loyalty_task(customer_id))
-            #     customer_loyalty_executed = True
+            # --- Step 1: Run customer loyalty in background (once per session) ---
+            customer_id = "CUST001"
+            if not customer_loyalty_executed:
+                asyncio.create_task(run_customer_loyalty_task(customer_id, user_message))
+                customer_loyalty_executed = True
 
-            # # --- Step 2: Classify intent and select agent ---
-            # try:
-            #     formatted_history = format_chat_history(
-            #         redact_bad_prompts_in_history(chat_history, bad_prompts)
-            #     )
-            #     with tracer.start_as_current_span("Handoff Intent Classification"):
-            #         agent_name, agent_selected = await classify_intent(
-            #             handoff_service, user_message, session_id,
-            #             formatted_history, validated_env_vars,
-            #             websocket, persistent_cart,
-            #         )
-            #     if not agent_name:
-            #         continue
-            # except Exception as e:
-            #     logger.error("Error during handoff classification", exc_info=True)
-            #     await websocket.send_text(fast_json_dumps({
-            #         "answer": "Error during handoff classification",
-            #         "error": str(e), "cart": persistent_cart,
-            #     }))
-            #     continue
+            # --- Step 2: Classify intent and select agent ---
+            try:
+                formatted_history = format_chat_history(
+                    redact_bad_prompts_in_history(chat_history, bad_prompts)
+                )
+                if is_cart_intent:
+                    agent_name = "cart_manager"
+                    agent_selected = validated_env_vars.get("cart_manager")
+                    logger.info(
+                        "Cart intent detected; routing directly to cart_manager",
+                        extra={"trace_component": "cart_routing", "session_id": session_id},
+                    )
+                    if not agent_selected:
+                        await websocket.send_text(fast_json_dumps({
+                            "answer": "Cart manager agent is not configured.",
+                            "agent": None,
+                            "cart": persistent_cart,
+                        }))
+                        continue
+                else:
+                    with tracer.start_as_current_span("Handoff Intent Classification"):
+                        agent_name, agent_selected = await classify_intent(
+                            handoff_service, user_message, session_id,
+                            formatted_history, validated_env_vars,
+                            websocket, persistent_cart,
+                        )
+                if not agent_name:
+                    continue
+            except Exception as e:
+                logger.error("Error during handoff classification", exc_info=True)
+                await websocket.send_text(fast_json_dumps({
+                    "answer": "Error during handoff classification",
+                    "error": str(e), "cart": persistent_cart,
+                }))
+                continue
 
-            # # --- Step 3: Enrich context and execute agent ---
-            # try:
-            #     agent_execution_start_time = time.time()
-            #
-            #     # Special case: image creation
-            #     if agent_name == "interior_designer_create_image":
-            #         response_data = await handle_image_creation(
-            #             user_message, persistent_image_url, image_cache,
-            #             get_cached_image_description, session_discount_percentage,
-            #             persistent_cart, websocket,
-            #         )
-            #         await websocket.send_text(fast_json_dumps(response_data))
-            #         continue
-            #
-            #     # Enrich message with image + product context
-            #     enriched_message = await enrich_context(
-            #         user_message, agent_name, image_url, image_cache,
-            #         get_cached_image_description, websocket, persistent_cart,
-            #     )
-            #
-            #     # Prepare agent-specific context
-            #     agent_context = enriched_message
-            #     if agent_name == "cart_manager":
-            #         agent_context += f"\n\nRAW_IO_HISTORY:\n{fast_json_dumps(list(raw_io_history), option=orjson.OPT_INDENT_2)}"
-            #     elif agent_name == "cora":
-            #         agent_context = f"{formatted_history}\n\nUser: {enriched_message}"
-            #
-            #     # Execute agent
-            #     bot_reply = await execute_agent(
-            #         agent_name, agent_selected, agent_context,
-            #         project_client, tracer,
-            #     )
-            #     log_timing("Agent Execution", agent_execution_start_time, f"Agent: {agent_name}")
-            #
-            #     # --- Step 4: Process response and update session state ---
-            #     parsed_response, session_discount_percentage, persistent_cart = process_response(
-            #         bot_reply, agent_name, session_discount_percentage, persistent_cart,
-            #     )
-            #
-            #     bot_answer = parsed_response.get("answer", bot_reply or "")
-            #     product_names = extract_product_names_from_response(parsed_response)
-            #     chat_history.append(("bot", bot_answer + product_names))
-            #     chat_history = clean_conversation_history(chat_history)
-            #
-            #     response_json = fast_json_dumps({**parsed_response, "cart": persistent_cart})
-            #     raw_io_history.append({"output": response_json, "cart": persistent_cart})
-            #     await websocket.send_text(response_json)
-            #
-            #     # Send delayed loyalty response after first cart operation
-            #     if agent_name == "cart_manager" and session_loyalty_response and not loyalty_response_sent:
-            #         await websocket.send_text(fast_json_dumps({**session_loyalty_response, "cart": persistent_cart}))
-            #         loyalty_response_sent = True
-            #
-            # except Exception as e:
-            #     logger.error("Error in agent execution", exc_info=True)
-            #     await websocket.send_text(fast_json_dumps({
-            #         "answer": "Internal server error",
-            #         "error": str(e), "cart": persistent_cart,
-            #     }))
+            # --- Step 3: Enrich context and execute agent ---
+            try:
+                agent_execution_start_time = time.time()
+            
+                # Special case: image creation
+                if agent_name == "interior_designer_create_image":
+                    response_data = await handle_image_creation(
+                        user_message, persistent_image_url, image_cache,
+                        get_cached_image_description, session_discount_percentage,
+                        persistent_cart, websocket,
+                    )
+                    await websocket.send_text(fast_json_dumps(response_data))
+                    continue
+            
+                # Enrich message with image + product context
+                enriched_message = await enrich_context(
+                    user_message, agent_name, image_url, image_cache,
+                    get_cached_image_description, websocket, persistent_cart,
+                )
+            
+                # Prepare agent-specific context
+                agent_context = enriched_message
+                if agent_name == "cart_manager":
+                    agent_context += f"\n\nRAW_IO_HISTORY:\n{fast_json_dumps(list(raw_io_history), option=orjson.OPT_INDENT_2)}"
+                elif agent_name == "cora":
+                    agent_context = f"{formatted_history}\n\nUser: {enriched_message}"
+            
+                # Execute agent
+                bot_reply = await execute_agent(
+                    agent_name, agent_selected, agent_context,
+                    project_client, tracer,
+                )
+                log_timing("Agent Execution", agent_execution_start_time, f"Agent: {agent_name}")
+            
+                # --- Step 4: Process response and update session state ---
+                parsed_response, session_discount_percentage, persistent_cart = process_response(
+                    bot_reply, agent_name, session_discount_percentage, persistent_cart,
+                )
+            
+                bot_answer = parsed_response.get("answer", bot_reply or "")
+                product_names = extract_product_names_from_response(parsed_response)
+                chat_history.append(("bot", bot_answer + product_names))
+                chat_history = clean_conversation_history(chat_history)
+            
+                response_json = fast_json_dumps({**parsed_response, "cart": persistent_cart})
+                raw_io_history.append({"output": response_json, "cart": persistent_cart})
+                await websocket.send_text(response_json)
+            
+                # Send delayed loyalty response after first cart operation
+                if agent_name == "cart_manager" and session_loyalty_response and not loyalty_response_sent:
+                    await websocket.send_text(fast_json_dumps({**session_loyalty_response, "cart": persistent_cart}))
+                    loyalty_response_sent = True
+            
+            except Exception as e:
+                logger.error("Error in agent execution", exc_info=True)
+                await websocket.send_text(fast_json_dumps({
+                    "answer": "Internal server error",
+                    "error": str(e), "cart": persistent_cart,
+                }))
     
     # =============================================================================
     # SESSION-LEVEL ERROR HANDLING: Catch WebSocket disconnects and errors

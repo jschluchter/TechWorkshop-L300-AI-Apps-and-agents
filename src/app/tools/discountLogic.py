@@ -1,4 +1,5 @@
 import os
+import logging
 import pandas as pd
 from openai import AzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -9,15 +10,23 @@ from opentelemetry import trace
 from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.ai.agents.telemetry import trace_function
 import time
-# from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
+from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
 
 # Enable Azure Monitor tracing
 application_insights_connection_string = os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
-# configure_azure_monitor(connection_string=application_insights_connection_string)
-# OpenAIInstrumentor().instrument()
+configure_azure_monitor(connection_string=application_insights_connection_string)
+OpenAIInstrumentor().instrument()
 
-# scenario = os.path.basename(__file__)
-# tracer = trace.get_tracer(__name__)
+scenario = os.path.basename(__file__)
+tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
+logger.info(
+    "Telemetry initialized for discount logic tool",
+    extra={
+        "trace_component": "discount_logic",
+        "has_appinsights_connection_string": bool(application_insights_connection_string),
+    },
+)
 
 #Azure OpenAI
 endpoint = os.getenv("gpt_endpoint")
@@ -34,7 +43,10 @@ with open(PROMPT_PATH, 'r', encoding='utf-8') as file:
 
 @trace_function()
 def calculate_discount(CustomerID):
-    print(f"calculate_discount function:{CustomerID}")
+    logger.info(
+        "Trace span started: calculate_discount",
+        extra={"trace_component": "discount_logic", "customer_id": CustomerID},
+    )
     """
     Calculate the discount based on customer data.
 
@@ -46,7 +58,7 @@ def calculate_discount(CustomerID):
     """
 
     start_time = time.time()
-    # @trace_function()
+    @trace_function()
     def get_transaction_data(CustomerID):
         start_time = time.time()
         time.sleep(0.5)  # Simulating a delay for demonstration purposes
@@ -71,12 +83,19 @@ def calculate_discount(CustomerID):
             else:
                 result = "121.53"
         except Exception as e:
-            print(f"Error: {e}")
+            logger.error("Transaction data lookup failed", exc_info=True)
             result = "0.0"
         end_time = time.time()
-        print(f"get_transaction_data Execution Time: {end_time - start_time} seconds")
+        logger.info(
+            "Trace span completed: get_transaction_data",
+            extra={
+                "trace_component": "discount_logic",
+                "customer_id": CustomerID,
+                "elapsed_ms": int((end_time - start_time) * 1000),
+            },
+        )
         return result
-    # @trace_function()    
+    @trace_function()
     def fetch_loyalty_profile_data(CustomerID:str):
         start_time = time.time()
         """
@@ -116,20 +135,31 @@ def calculate_discount(CustomerID):
                 'Tenure': [2],
                 'Churn': [0.3]
             })
+        logger.info(
+            "Trace span completed: fetch_loyalty_profile_data",
+            extra={
+                "trace_component": "discount_logic",
+                "customer_id": CustomerID,
+                "elapsed_ms": int((time.time() - start_time) * 1000),
+            },
+        )
         return df  
-    # @trace_function()
-    def discount_logic_using_model(transaction_info,loyalty_info):
+    @trace_function()
+    def discount_logic_using_model(transaction_info, loyalty_info):
         start_time = time.time()
+        logger.info(
+            "Trace span started: discount_logic_using_model",
+            extra={"trace_component": "discount_logic"},
+        )
         """
         Calculates the discount percentage for a customer based on transaction and loyalty data.
 
         Args:
             transaction_info (float or int): Includes total price for a given customer ID from the transaction data.
-            loyalty_info (dict): Includes customer tenure, churn risk score,lifetime value and loyalty tier or program eligibility.
-            InvoiceValue (float or int): The amount the customer is spending in the current purchase.
+            loyalty_info (DataFrame): Customer loyalty profile data including tenure, churn risk, lifetime value, etc.
 
         Returns:
-            float: Discount amount to be applied based on the business logic.
+            str: Discount calculation response from the LLM.
         """
         # Initialize client
         client = AzureOpenAI(
@@ -137,10 +167,27 @@ def calculate_discount(CustomerID):
             azure_ad_token_provider=token_provider,
             api_version=api_version,
         )
-        # print(f"loyalty_info is:{loyalty_info}, invoice value: {InvoiceValue} and transaction_info is:{transaction_info}")
-        prompt= "Bruno's total transaction price in this year"+ transaction_info + "and his data"+str(loyalty_info)
-        # print(f"prompt:{prompt}")
-        # print(f"Prompt for agent:{PROMPT}")
+        
+        # Convert DataFrame to dict format for better LLM readability
+        if isinstance(loyalty_info, pd.DataFrame):
+            loyalty_dict = loyalty_info.iloc[0].to_dict() if len(loyalty_info) > 0 else {}
+            customer_name = loyalty_dict.get('CustomerName', 'Customer')
+        else:
+            loyalty_dict = loyalty_info
+            customer_name = 'Customer'
+        
+        # Construct a clear, structured prompt
+        prompt = f"{customer_name}'s transaction data:\n- Total spent this year: ${transaction_info}\n- Loyalty Profile: {loyalty_dict}"
+        
+        logger.info(
+            "Discount logic prompt constructed",
+            extra={
+                "trace_component": "discount_logic",
+                "customer_name": customer_name,
+                "transaction_info": transaction_info,
+            },
+        )
+        
         # Define chat prompt
         chat_prompt = [
             {
@@ -177,7 +224,13 @@ def calculate_discount(CustomerID):
         span = trace.get_current_span()
         span.set_attribute("discount_logic_response", response_message)
         end_time = time.time()
-        print(f"discount_logic_using_model Execution Time: {end_time - start_time} seconds")
+        logger.info(
+            "Trace span completed: discount_logic_using_model",
+            extra={
+                "trace_component": "discount_logic",
+                "elapsed_ms": int((end_time - start_time) * 1000),
+            },
+        )
         return response_message
 
     transaction_info=get_transaction_data(CustomerID)
@@ -186,5 +239,12 @@ def calculate_discount(CustomerID):
     # print(f"loyalty_info :{loyalty_info}")
     discount_info=discount_logic_using_model(transaction_info,loyalty_info)
     end_time = time.time()
-    # print(f"calculate_discount Execution Time: {end_time - start_time} seconds")
+    logger.info(
+        "Trace span completed: calculate_discount",
+        extra={
+            "trace_component": "discount_logic",
+            "customer_id": CustomerID,
+            "elapsed_ms": int((end_time - start_time) * 1000),
+        },
+    )
     return discount_info

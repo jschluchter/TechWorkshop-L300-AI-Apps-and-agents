@@ -28,17 +28,24 @@ from app.agents.tool_definitions import get_tools_for_agent
 from opentelemetry import trace
 from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.ai.agents.telemetry import trace_function
-# from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
+from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
 
 # Enable Azure Monitor tracing
 application_insights_connection_string = os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
-# configure_azure_monitor(connection_string=application_insights_connection_string)
-# OpenAIInstrumentor().instrument()
+configure_azure_monitor(connection_string=application_insights_connection_string)
+OpenAIInstrumentor().instrument()
 
-# scenario = os.path.basename(__file__)
-# tracer = trace.get_tracer(__name__)
+scenario = os.path.basename(__file__)
+tracer = trace.get_tracer(__name__)
 
 logger = logging.getLogger(__name__)
+logger.info(
+    "Telemetry initialized for agent processor",
+    extra={
+        "trace_component": "agent_processor",
+        "has_appinsights_connection_string": bool(application_insights_connection_string),
+    },
+)
 
 # Thread pool for running sync OpenAI SDK calls from async context
 _executor = ThreadPoolExecutor(max_workers=8)
@@ -98,8 +105,17 @@ class AgentProcessor:
 
     # -- Async API (preferred) --------------------------------------------
 
+    @trace_function()
     async def _execute_function_calls(self, message) -> list:
         """Dispatch function calls from agent output to MCP tool handlers."""
+        logger.info(
+            "Trace span started: execute_function_calls",
+            extra={
+                "trace_component": "agent_processor",
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+            },
+        )
         input_list: ResponseInputParam = []
         for item in message.output:
             if item.type != "function_call":
@@ -117,12 +133,32 @@ class AgentProcessor:
                 call_id=item.call_id,
                 output=json.dumps({"result": func_result})
             ))
+        logger.info(
+            "Trace span completed: execute_function_calls",
+            extra={
+                "trace_component": "agent_processor",
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+                "function_call_outputs": len(input_list),
+            },
+        )
         return input_list
 
+    @trace_function()
     async def _run_conversation(self, input_message: str = "") -> List[str]:
         """Run a single conversation turn, handling any function calls."""
         thread_id = self.thread_id
         start_time = time.time()
+        logger.info(
+            "Trace span started: run_conversation",
+            extra={
+                "trace_component": "agent_processor",
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+                "thread_id": thread_id,
+                "input_length": len(input_message or ""),
+            },
+        )
 
         try:
             openai_client = self.project_client.get_openai_client()
@@ -170,18 +206,47 @@ class AgentProcessor:
                     )
                 )
 
+            logger.info(
+                "Trace span completed: run_conversation",
+                extra={
+                    "trace_component": "agent_processor",
+                    "agent_id": self.agent_id,
+                    "agent_type": self.agent_type,
+                    "thread_id": self.thread_id,
+                    "elapsed_ms": int((time.time() - start_time) * 1000),
+                },
+            )
+
             return [self._extract_text(message)]
 
         except Exception as e:
             logger.error(f"Conversation failed: {e}", exc_info=True)
             return [f"Error processing message: {str(e)}"]
 
+    @trace_function()
     async def run_conversation_with_text_stream(self, input_message: str = ""):
         """Async generator that yields text responses from the agent."""
+        logger.info(
+            "Trace span started: run_conversation_with_text_stream",
+            extra={
+                "trace_component": "agent_processor",
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+            },
+        )
         try:
             messages = await self._run_conversation(input_message)
             for msg in messages:
                 yield msg
+            logger.info(
+                "Trace span completed: run_conversation_with_text_stream",
+                extra={
+                    "trace_component": "agent_processor",
+                    "agent_id": self.agent_id,
+                    "agent_type": self.agent_type,
+                    "message_count": len(messages),
+                },
+            )
         except Exception as e:
             logger.error(f"Async conversation failed: {e}")
             yield f"Error processing message: {str(e)}"
